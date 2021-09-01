@@ -7,10 +7,12 @@ class TextCursor extends StatefulWidget {
     Key? key,
     this.duration = const Duration(milliseconds: 500),
     this.resumed = false,
+    this.cursorColor,
   }) : super(key: key);
 
   final Duration duration;
   final bool resumed;
+  final Color? cursorColor;
 
   @override
   _TextCursorState createState() => _TextCursorState();
@@ -46,7 +48,10 @@ class _TextCursorState extends State<TextCursor>
         opacity: _displayed && widget.resumed ? 1.0 : 0.0,
         child: Container(
           width: 2.0,
-          color: theme.textSelectionTheme.cursorColor,
+          color: widget.cursorColor ??
+              theme.textSelectionTheme.cursorColor ??
+              theme.textSelectionTheme.selectionColor ??
+              theme.primaryColor,
         ),
       ),
     );

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -12,13 +11,15 @@ typedef ChipsInputSuggestions<T> = FutureOr<List<T>> Function(String query);
 typedef ChipSelected<T> = void Function(T data, bool selected);
 typedef ChipsBuilder<T> = Widget Function(
     BuildContext context, ChipsInputState<T> state, T data);
+typedef OnChipInputActionDone<T> = void Function(ChipsInputState<T> state, String value);
+typedef OnChipInputChangeFocusAction<T> = void Function(ChipsInputState<T> state, String value);
 
 const kObjectReplacementChar = 0xFFFD;
 
 extension on TextEditingValue {
   String get normalCharactersText => String.fromCharCodes(
-        text.codeUnits.where((ch) => ch != kObjectReplacementChar),
-      );
+    text.codeUnits.where((ch) => ch != kObjectReplacementChar),
+  );
 
   List<int> get replacementCharacters => text.codeUnits
       .where((ch) => ch == kObjectReplacementChar)
@@ -37,7 +38,6 @@ class ChipsInput<T> extends StatefulWidget {
     required this.suggestionBuilder,
     required this.findSuggestions,
     required this.onChanged,
-    this.onChipTapped,
     this.maxChips,
     this.textStyle,
     this.suggestionsBoxMaxHeight,
@@ -53,6 +53,9 @@ class ChipsInput<T> extends StatefulWidget {
     this.allowChipEditing = false,
     this.focusNode,
     this.initialSuggestions,
+    this.onChipInputActionDone,
+    this.onChipInputChangeFocusAction,
+    this.cursorColor,
   })  : assert(maxChips == null || initialValue.length <= maxChips),
         super(key: key);
 
@@ -61,8 +64,6 @@ class ChipsInput<T> extends StatefulWidget {
   final bool enabled;
   final ChipsInputSuggestions<T> findSuggestions;
   final ValueChanged<List<T>> onChanged;
-  @Deprecated('Will be removed in the next major version')
-  final ValueChanged<T>? onChipTapped;
   final ChipsBuilder<T> chipBuilder;
   final ChipsBuilder<T> suggestionBuilder;
   final List<T> initialValue;
@@ -79,8 +80,9 @@ class ChipsInput<T> extends StatefulWidget {
   final bool allowChipEditing;
   final FocusNode? focusNode;
   final List<T>? initialSuggestions;
-
-  // final Color cursorColor;
+  final OnChipInputActionDone? onChipInputActionDone;
+  final OnChipInputChangeFocusAction? onChipInputChangeFocusAction;
+  final Color? cursorColor;
 
   final TextCapitalization textCapitalization;
 
@@ -91,34 +93,39 @@ class ChipsInput<T> extends StatefulWidget {
 class ChipsInputState<T> extends State<ChipsInput<T>>
     implements TextInputClient {
   Set<T> _chips = <T>{};
-  List<T>? _suggestions;
-  final _suggestionsStreamController = StreamController<List<T>>.broadcast();
+  List<T?>? _suggestions;
+  final StreamController<List<T?>?> _suggestionsStreamController =
+  StreamController<List<T>?>.broadcast();
   int _searchId = 0;
   TextEditingValue _value = TextEditingValue();
   TextInputConnection? _textInputConnection;
   late SuggestionsBoxController _suggestionsBoxController;
   final _layerLink = LayerLink();
-  final _enteredTexts = <T, String>{};
+  final Map<T?, String> _enteredTexts = <T, String>{};
 
   TextInputConfiguration get textInputConfiguration => TextInputConfiguration(
-        inputType: widget.inputType,
-        obscureText: widget.obscureText,
-        autocorrect: widget.autocorrect,
-        actionLabel: widget.actionLabel,
-        inputAction: widget.inputAction,
-        keyboardAppearance: widget.keyboardAppearance,
-        textCapitalization: widget.textCapitalization,
-      );
+    inputType: widget.inputType,
+    obscureText: widget.obscureText,
+    autocorrect: widget.autocorrect,
+    actionLabel: widget.actionLabel,
+    inputAction: widget.inputAction,
+    keyboardAppearance: widget.keyboardAppearance,
+    textCapitalization: widget.textCapitalization,
+  );
 
-  bool get _hasInputConnection => _textInputConnection?.attached ?? false;
+  bool get _hasInputConnection =>
+      _textInputConnection != null && _textInputConnection!.attached;
 
   bool get _hasReachedMaxChips =>
       widget.maxChips != null && _chips.length >= widget.maxChips!;
 
-  late FocusNode _focusNode;
+  FocusNode? _focusNode;
+  FocusNode get _effectiveFocusNode => widget.focusNode ?? (_focusNode ??= FocusNode());
   late FocusAttachment _nodeAttachment;
 
-  RenderBox get renderBox => context.findRenderObject() as RenderBox;
+  RenderBox? get renderBox => context.findRenderObject() as RenderBox?;
+
+  bool get _canRequestFocus => widget.enabled;
 
   @override
   void initState() {
@@ -129,14 +136,14 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
         .toList(growable: false);
     _suggestionsBoxController = SuggestionsBoxController(context);
 
-    _focusNode = widget.focusNode ?? FocusNode();
-    _focusNode.addListener(_handleFocusChanged);
-    _nodeAttachment = _focusNode.attach(context);
+    _effectiveFocusNode.addListener(_handleFocusChanged);
+    _nodeAttachment = _effectiveFocusNode.attach(context);
+    _effectiveFocusNode.canRequestFocus = _canRequestFocus;
 
-    WidgetsBinding.instance?.addPostFrameCallback((_) async {
+    WidgetsBinding.instance!.addPostFrameCallback((_) async {
       _initOverlayEntry();
       if (mounted && widget.autofocus) {
-        FocusScope.of(context).autofocus(_focusNode);
+        FocusScope.of(context).autofocus(_effectiveFocusNode);
       }
     });
   }
@@ -144,29 +151,26 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   @override
   void dispose() {
     _closeInputConnectionIfNeeded();
-
-    _focusNode.removeListener(_handleFocusChanged);
-    if (null == widget.focusNode) {
-      _focusNode.dispose();
-    }
-
+    _effectiveFocusNode.removeListener(_handleFocusChanged);
+    _focusNode?.dispose();
     _suggestionsStreamController.close();
     _suggestionsBoxController.close();
     super.dispose();
   }
 
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-  }
-
   void _handleFocusChanged() {
-    if (_focusNode.hasFocus) {
+    if (_effectiveFocusNode.hasFocus) {
       _openInputConnection();
       _suggestionsBoxController.open();
     } else {
       _closeInputConnectionIfNeeded();
       _suggestionsBoxController.close();
+      final value = _value.normalCharactersText;
+      if (value.isNotEmpty) {
+        if (widget.onChipInputChangeFocusAction != null) {
+          widget.onChipInputChangeFocusAction!(this, value);
+        };
+      }
     }
     if (mounted) {
       setState(() {
@@ -176,18 +180,18 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   }
 
   void requestKeyboard() {
-    if (_focusNode.hasFocus) {
+    if (_effectiveFocusNode.hasFocus) {
       _openInputConnection();
     } else {
-      FocusScope.of(context).requestFocus(_focusNode);
+      FocusScope.of(context).requestFocus(_effectiveFocusNode);
     }
   }
 
   void _initOverlayEntry() {
     _suggestionsBoxController.overlayEntry = OverlayEntry(
       builder: (context) {
-        final size = renderBox.size;
-        final renderBoxOffset = renderBox.localToGlobal(Offset.zero);
+        final size = renderBox!.size;
+        final renderBoxOffset = renderBox!.localToGlobal(Offset.zero);
         final topAvailableSpace = renderBoxOffset.dy;
         final mq = MediaQuery.of(context);
         final bottomAvailableSpace = mq.size.height -
@@ -202,9 +206,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
         final showTop = topAvailableSpace > bottomAvailableSpace;
         // print("showTop: $showTop" );
         final compositedTransformFollowerOffset =
-            showTop ? Offset(0, -size.height) : Offset.zero;
+        showTop ? Offset(0, -size.height) : Offset.zero;
 
-        return StreamBuilder<List<T>>(
+        return StreamBuilder<List<T?>?>(
           stream: _suggestionsStreamController.stream,
           initialData: _suggestions,
           builder: (context, snapshot) {
@@ -220,11 +224,13 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
                     padding: EdgeInsets.zero,
                     itemCount: snapshot.data!.length,
                     itemBuilder: (BuildContext context, int index) {
-                      return widget.suggestionBuilder(
+                      return _suggestions != null
+                          ? widget.suggestionBuilder(
                         context,
                         this,
-                        _suggestions![index],
-                      );
+                        _suggestions![index]!,
+                      )
+                          : Container();
                     },
                   ),
                 ),
@@ -238,9 +244,9 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
                   child: !showTop
                       ? suggestionsListView
                       : FractionalTranslation(
-                          translation: const Offset(0, -1),
-                          child: suggestionsListView,
-                        ),
+                    translation: const Offset(0, -1),
+                    child: suggestionsListView,
+                  ),
                 ),
               );
             }
@@ -253,25 +259,24 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
 
   void selectSuggestion(T data) {
     if (!_hasReachedMaxChips) {
-      _chips.add(data);
+      setState(() => _chips = _chips..add(data));
       if (widget.allowChipEditing) {
         final enteredText = _value.normalCharactersText;
         if (enteredText.isNotEmpty) _enteredTexts[data] = enteredText;
       }
       _updateTextInputState(replaceText: true);
-
-      _suggestions = null;
-      _suggestionsStreamController.add([]);
-      if (widget.maxChips == _chips.length) _suggestionsBoxController.close();
+      setState(() => _suggestions = null);
+      _suggestionsStreamController.add(_suggestions);
+      if (_hasReachedMaxChips) _suggestionsBoxController.close();
+      widget.onChanged(_chips.toList(growable: false));
     } else {
       _suggestionsBoxController.close();
     }
-    widget.onChanged(_chips.toList(growable: false));
   }
 
   void deleteChip(T data) {
     if (widget.enabled) {
-      _chips.remove(data);
+      setState(() => _chips.remove(data));
       if (_enteredTexts.containsKey(data)) _enteredTexts.remove(data);
       _updateTextInputState();
       widget.onChanged(_chips.toList(growable: false));
@@ -303,10 +308,13 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
     final localId = ++_searchId;
     final results = await widget.findSuggestions(value);
     if (_searchId == localId && mounted) {
-      _suggestions =
-          results.where((r) => !_chips.contains(r)).toList(growable: false);
+      setState(() => _suggestions =
+          results.where((r) => !_chips.contains(r)).toList(growable: false));
     }
     _suggestionsStreamController.add(_suggestions ?? []);
+    if (!_suggestionsBoxController.isOpened && !_hasReachedMaxChips) {
+      _suggestionsBoxController.open();
+    }
   }
 
   void _closeInputConnectionIfNeeded() {
@@ -322,15 +330,13 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
     // _receivedRemoteTextEditingValue = value;
     final _oldTextEditingValue = _value;
     if (value.text != _oldTextEditingValue.text) {
-      setState(() {
-        _value = value;
-      });
+      setState(() => _value = value);
       if (value.replacementCharactersCount <
           _oldTextEditingValue.replacementCharactersCount) {
         final removedChip = _chips.last;
-        _chips = Set.of(_chips.take(value.replacementCharactersCount));
+        setState(() => _chips = Set.of(_chips.take(value.replacementCharactersCount)));
         widget.onChanged(_chips.toList(growable: false));
-        var putText = '';
+        String? putText = '';
         if (widget.allowChipEditing && _enteredTexts.containsKey(removedChip)) {
           putText = _enteredTexts[removedChip]!;
           _enteredTexts.remove(removedChip);
@@ -343,25 +349,20 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
     }
   }
 
-  void _updateTextInputState({bool replaceText = false, String putText = ''}) {
-    final updatedText =
-        String.fromCharCodes(_chips.map((_) => kObjectReplacementChar)) +
-            "${replaceText ? '' : _value.normalCharactersText}" +
-            putText;
-    setState(() {
-      final textLength = updatedText.characters.length;
-      final replacedLength = _chips.length;
-      _value = _value.copyWith(
+  void _updateTextInputState({replaceText = false, putText = ''}) {
+    if (replaceText || putText != '') {
+      final updatedText =
+          String.fromCharCodes(_chips.map((_) => kObjectReplacementChar)) +
+              "${replaceText ? '' : _value.normalCharactersText}" +
+              putText;
+      setState(() => _value = _value.copyWith(
         text: updatedText,
-        selection: TextSelection.collapsed(offset: textLength),
-        composing: (Platform.isIOS || replacedLength == textLength)
-            ? TextRange.empty
-            : TextRange(
-                start: replacedLength,
-                end: textLength,
-              ),
-      );
-    });
+        selection: TextSelection.collapsed(offset: updatedText.length),
+        //composing: TextRange(start: 0, end: text.length),
+        composing: TextRange.empty,
+      ));
+    }
+    _closeInputConnectionIfNeeded(); //Hack for #34 (https://github.com/danvick/flutter_chips_input/issues/34#issuecomment-684505282). TODO: Find permanent fix
     _textInputConnection ??= TextInput.attach(this, textInputConfiguration);
     _textInputConnection?.setEditingState(_value);
   }
@@ -370,19 +371,34 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   void performAction(TextInputAction action) {
     switch (action) {
       case TextInputAction.done:
+        final value = _value.normalCharactersText;
+        if (value.isNotEmpty) {
+          if (widget.onChipInputActionDone != null) {
+            widget.onChipInputActionDone!(this, value);
+          };
+        } else {
+          _effectiveFocusNode.unfocus();
+        }
+        break;
       case TextInputAction.go:
       case TextInputAction.send:
       case TextInputAction.search:
-        if (_suggestions != null && _suggestions!.isNotEmpty) {
-          selectSuggestion(_suggestions!.first);
+        if (_suggestions?.isNotEmpty ?? false) {
+          selectSuggestion(_suggestions!.first!);
         } else {
-          _focusNode.unfocus();
+          _effectiveFocusNode.unfocus();
         }
         break;
       default:
-        _focusNode.unfocus();
+        _effectiveFocusNode.unfocus();
         break;
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _effectiveFocusNode.canRequestFocus = _canRequestFocus;
   }
 
   @override
@@ -393,6 +409,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   @override
   void didUpdateWidget(covariant ChipsInput<T> oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _effectiveFocusNode.canRequestFocus = _canRequestFocus;
   }
 
   @override
@@ -437,12 +454,14 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
                 maxLines: 1,
                 overflow: widget.textOverflow,
                 style: widget.textStyle ??
-                    theme.textTheme.subtitle1?.copyWith(height: 1.5),
+                    theme.textTheme.subtitle1!.copyWith(height: 1.5),
               ),
             ),
             Flexible(
               flex: 0,
-              child: TextCursor(resumed: _focusNode.hasFocus),
+              child: TextCursor(
+                  cursorColor: widget.cursorColor,
+                  resumed: _effectiveFocusNode.hasFocus),
             ),
           ],
         ),
@@ -466,7 +485,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
               },
               child: InputDecorator(
                 decoration: widget.decoration,
-                isFocused: _focusNode.hasFocus,
+                isFocused: _effectiveFocusNode.hasFocus,
                 isEmpty: _value.text.isEmpty && _chips.isEmpty,
                 child: Wrap(
                   crossAxisAlignment: WrapCrossAlignment.center,

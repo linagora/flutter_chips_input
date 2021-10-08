@@ -93,8 +93,8 @@ class ChipsInput<T> extends StatefulWidget {
 class ChipsInputState<T> extends State<ChipsInput<T>>
     implements TextInputClient {
   Set<T> _chips = <T>{};
-  List<T?>? _suggestions;
-  final StreamController<List<T?>?> _suggestionsStreamController =
+  List<T>? _suggestions;
+  final StreamController<List<T>?> _suggestionsStreamController =
   StreamController<List<T>?>.broadcast();
   int _searchId = 0;
   TextEditingValue _value = TextEditingValue();
@@ -102,6 +102,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   late SuggestionsBoxController _suggestionsBoxController;
   final _layerLink = LayerLink();
   final Map<T?, String> _enteredTexts = <T, String>{};
+  bool backspaceDeleting = false;
 
   TextInputConfiguration get textInputConfiguration => TextInputConfiguration(
     inputType: widget.inputType,
@@ -208,7 +209,7 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
         final compositedTransformFollowerOffset =
         showTop ? Offset(0, -size.height) : Offset.zero;
 
-        return StreamBuilder<List<T?>?>(
+        return StreamBuilder<List<T>?>(
           stream: _suggestionsStreamController.stream,
           initialData: _suggestions,
           builder: (context, snapshot) {
@@ -225,12 +226,12 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
                     itemCount: snapshot.data!.length,
                     itemBuilder: (BuildContext context, int index) {
                       return _suggestions != null
-                          ? widget.suggestionBuilder(
-                        context,
-                        this,
-                        _suggestions![index]!,
-                      )
-                          : Container();
+                        ? widget.suggestionBuilder(
+                            context,
+                            this,
+                            _suggestions![index]!,
+                          )
+                        : Container();
                     },
                   ),
                 ),
@@ -298,8 +299,10 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
   void _scrollToVisible() {
     Future.delayed(const Duration(milliseconds: 300), () {
       WidgetsBinding.instance?.addPostFrameCallback((_) async {
-        final renderBox = context.findRenderObject() as RenderBox;
-        await Scrollable.of(context)?.position.ensureVisible(renderBox);
+        final renderBox = context.findRenderObject();
+        if (renderBox != null) {
+          await Scrollable.of(context)?.position.ensureVisible(renderBox);
+        }
       });
     });
   }
@@ -329,24 +332,49 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
     //print("updateEditingValue FIRED with ${value.text}");
     // _receivedRemoteTextEditingValue = value;
     final _oldTextEditingValue = _value;
-    if (value.text != _oldTextEditingValue.text) {
-      setState(() => _value = value);
-      if (value.replacementCharactersCount <
-          _oldTextEditingValue.replacementCharactersCount) {
+    // Fix enter '@', '.' delete input text with keyboard vietnamese on SamSung device
+    var _newTextEditingValue = value;
+    if (_oldTextEditingValue.normalCharactersText.isNotEmpty) {
+      if (_newTextEditingValue.normalCharactersText == '@' && !_oldTextEditingValue.normalCharactersText.endsWith('@')) {
+        final newText = '${_oldTextEditingValue.text}${_newTextEditingValue.normalCharactersText}';
+        _newTextEditingValue = TextEditingValue(
+            text: newText,
+            selection: TextSelection.collapsed(offset: newText.length));
+      } else if ((_newTextEditingValue.normalCharactersText.endsWith('..') && !_newTextEditingValue.normalCharactersText.endsWith('...'))
+          || (_newTextEditingValue.normalCharactersText.endsWith('@.') && !backspaceDeleting)) {
+        final newText = '${_oldTextEditingValue.text}.';
+        _newTextEditingValue = TextEditingValue(
+            text: newText,
+            selection: TextSelection.collapsed(offset: newText.length));
+      } else if (_newTextEditingValue.normalCharactersText == '.') {
+        final newText = '${_oldTextEditingValue.text}.';
+        _newTextEditingValue = TextEditingValue(
+            text: newText,
+            selection: TextSelection.collapsed(offset: newText.length));
+      }
+    }
+
+    if (_newTextEditingValue.text != _oldTextEditingValue.text) {
+      setState(() => _value = _newTextEditingValue);
+      if (_newTextEditingValue.replacementCharactersCount < _oldTextEditingValue.replacementCharactersCount) {
         final removedChip = _chips.last;
-        setState(() => _chips = Set.of(_chips.take(value.replacementCharactersCount)));
+        _chips = Set.of(_chips.take(_newTextEditingValue.replacementCharactersCount));
         widget.onChanged(_chips.toList(growable: false));
-        String? putText = '';
+        var putText = '';
         if (widget.allowChipEditing && _enteredTexts.containsKey(removedChip)) {
           putText = _enteredTexts[removedChip]!;
           _enteredTexts.remove(removedChip);
         }
         _updateTextInputState(putText: putText);
       } else {
-        _updateTextInputState();
+        if (backspaceDeleting) {
+          _updateTextInputState();
+        }
       }
       _onSearchChanged(_value.normalCharactersText);
     }
+
+    backspaceDeleting = false;
   }
 
   void _updateTextInputState({replaceText = false, putText = ''}) {
@@ -468,40 +496,57 @@ class ChipsInputState<T> extends State<ChipsInput<T>>
       ),
     );
 
-    return NotificationListener<SizeChangedLayoutNotification>(
-      onNotification: (SizeChangedLayoutNotification val) {
-        WidgetsBinding.instance?.addPostFrameCallback((_) async {
-          _suggestionsBoxController.overlayEntry?.markNeedsBuild();
-        });
-        return true;
+    return RawKeyboardListener(
+      focusNode: _effectiveFocusNode, // or FocusNode()
+      onKey: (event) {
+        final str = _value.text;
+        /// Make sure to filter event since without checking 'RawKeyDownEvent' will trigger this multiple times (2) because of RawKeyUpEvent
+        if (event.runtimeType.toString() == 'RawKeyDownEvent' &&
+            event.logicalKey == LogicalKeyboardKey.backspace &&
+            str.isNotEmpty) {
+          final sd = str.substring(0, str.length - 1);
+          backspaceDeleting = true;
+          /// Make sure to also update cursor position using the TextSelection.collapsed.
+          updateEditingValue(TextEditingValue(
+            text: sd,
+            selection: TextSelection.collapsed(offset: sd.length)));
+        }
       },
-      child: SizeChangedLayoutNotifier(
-        child: Column(
-          children: <Widget>[
-            GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () {
-                requestKeyboard();
-              },
-              child: InputDecorator(
-                decoration: widget.decoration,
-                isFocused: _effectiveFocusNode.hasFocus,
-                isEmpty: _value.text.isEmpty && _chips.isEmpty,
-                child: Wrap(
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  spacing: 4.0,
-                  runSpacing: 4.0,
-                  children: chipsChildren,
+      child: NotificationListener<SizeChangedLayoutNotification>(
+        onNotification: (SizeChangedLayoutNotification val) {
+          WidgetsBinding.instance?.addPostFrameCallback((_) async {
+            _suggestionsBoxController.overlayEntry?.markNeedsBuild();
+          });
+          return true;
+        },
+        child: SizeChangedLayoutNotifier(
+          child: Column(
+            children: <Widget>[
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  requestKeyboard();
+                },
+                child: InputDecorator(
+                  decoration: widget.decoration,
+                  isFocused: _effectiveFocusNode.hasFocus,
+                  isEmpty: _value.text.isEmpty && _chips.isEmpty,
+                  child: Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 4.0,
+                    runSpacing: 4.0,
+                    children: chipsChildren,
+                  ),
                 ),
               ),
-            ),
-            CompositedTransformTarget(
-              link: _layerLink,
-              child: Container(),
-            ),
-          ],
+              CompositedTransformTarget(
+                link: _layerLink,
+                child: Container(),
+              ),
+            ],
+          ),
         ),
-      ),
+      )
     );
   }
 }
